@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: team_notes
+      POSTGRES_USER: team_notes
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-team_notes}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - notes-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U team_notes -d team_notes"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  app:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SPRING_PROFILES_ACTIVE: local
+      DB_URL: jdbc:postgresql://db:5432/team_notes
+      DB_USERNAME: team_notes
+      DB_PASSWORD: ${DB_PASSWORD:-team_notes}
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  notes-data:

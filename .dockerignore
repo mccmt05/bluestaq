@@ -1,0 +1,7 @@
+.git
+.idea
+.tools
+.local-db
+target
+*.log
+.env

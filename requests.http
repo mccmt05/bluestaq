@@ -1,0 +1,66 @@
+@baseUrl = http://localhost:8080
+@teamId = 11111111-1111-4111-8111-111111111111
+
+### Health check (no credentials needed)
+GET {{baseUrl}}/health
+
+### Alice belongs to Platform and Research
+GET {{baseUrl}}/api/teams
+Authorization: Basic alice demo-password
+
+### Create a note in Platform; saves its ID for the following requests
+POST {{baseUrl}}/api/teams/{{teamId}}/notes
+Authorization: Basic alice demo-password
+Content-Type: application/json
+
+{
+  "title": "Release checklist",
+  "content": "Verify migrations before deployment."
+}
+
+> {%
+    client.test("Created", function () { client.assert(response.status === 201); });
+    client.global.set("noteId", response.body.id);
+%}
+
+### Bob can read his teammate's note
+GET {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
+Authorization: Basic bob demo-password
+
+### Bob can edit the note (version 1 becomes version 2)
+PUT {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
+Authorization: Basic bob demo-password
+Content-Type: application/json
+
+{
+  "title": "Release checklist",
+  "content": "Verify migrations and check service health.",
+  "version": 1
+}
+
+### An edit based on the old version returns 409
+PUT {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
+Authorization: Basic alice demo-password
+Content-Type: application/json
+
+{
+  "title": "My outdated edit",
+  "content": "This change will not overwrite Bob's edit.",
+  "version": 1
+}
+
+### Carol is outside Platform and receives 404
+GET {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
+Authorization: Basic carol demo-password
+
+### List notes with pagination
+GET {{baseUrl}}/api/teams/{{teamId}}/notes?page=0&size=20
+Authorization: Basic alice demo-password
+
+### A teammate can delete the note (204)
+DELETE {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
+Authorization: Basic bob demo-password
+
+### The deleted note now returns 404
+GET {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
+Authorization: Basic alice demo-password
