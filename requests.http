@@ -4,11 +4,30 @@
 ### Health check (no credentials needed)
 GET {{baseUrl}}/health
 
+> {%
+    const health = /** @type {{status: string}} */ (response.body);
+    client.test("Health is UP", function () {
+        client.assert(response.status === 200, "Expected 200");
+        client.assert(health.status === "UP", "Expected a healthy database connection");
+    });
+%}
+
 ### Alice belongs to Platform and Research
 GET {{baseUrl}}/api/teams
 Authorization: Basic alice demo-password
 
+> {%
+    client.test("Alice sees both teams", function () {
+        client.assert(response.status === 200, "Expected 200");
+        client.assert(Array.isArray(response.body) && response.body.length === 2, "Expected two teams");
+    });
+%}
+
 ### Create a note in Platform; saves its ID for the following requests
+< {%
+    // A failed creation must not reuse an ID left over from an earlier walkthrough.
+    client.global.clear("noteId");
+%}
 POST {{baseUrl}}/api/teams/{{teamId}}/notes
 Authorization: Basic alice demo-password
 Content-Type: application/json
@@ -19,13 +38,30 @@ Content-Type: application/json
 }
 
 > {%
-    client.test("Created", function () { client.assert(response.status === 201); });
-    client.global.set("noteId", response.body.id);
+    const note = /** @type {{id: string, version: number}} */ (response.body);
+    client.test("Note is created at version 1", function () {
+        client.assert(response.status === 201, "Expected 201");
+        client.assert(note && typeof note.id === "string" && note.id.length > 0,
+            "Expected a note ID");
+        client.assert(note.version === 1, "Expected initial version 1");
+    });
+    if (response.status === 201 && note && typeof note.id === "string" && note.id.length > 0) {
+        client.global.set("noteId", note.id);
+    }
 %}
 
 ### Bob can read his teammate's note
 GET {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
 Authorization: Basic bob demo-password
+
+> {%
+    const note = /** @type {{id: string, version: number}} */ (response.body);
+    client.test("Bob can read Alice's note", function () {
+        client.assert(response.status === 200, "Expected 200");
+        client.assert(note.id === client.global.get("noteId"), "Expected the created note");
+        client.assert(note.version === 1, "Expected version 1 before editing");
+    });
+%}
 
 ### Bob can edit the note (version 1 becomes version 2)
 PUT {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
@@ -38,6 +74,14 @@ Content-Type: application/json
   "version": 1
 }
 
+> {%
+    const note = /** @type {{version: number}} */ (response.body);
+    client.test("Bob's edit advances the version", function () {
+        client.assert(response.status === 200, "Expected 200");
+        client.assert(note.version === 2, "Expected version 2 after editing");
+    });
+%}
+
 ### An edit based on the old version returns 409
 PUT {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
 Authorization: Basic alice demo-password
@@ -49,18 +93,76 @@ Content-Type: application/json
   "version": 1
 }
 
+> {%
+    const error = /** @type {{code: string}} */ (response.body);
+    client.test("Stale edit is rejected", function () {
+        client.assert(response.status === 409, "Expected 409");
+        client.assert(error.code === "CONFLICT", "Expected a conflict error");
+    });
+%}
+
 ### Carol is outside Platform and receives 404
 GET {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
 Authorization: Basic carol demo-password
+
+> {%
+    client.test("Carol cannot access Platform notes", function () {
+        client.assert(response.status === 404, "Expected 404");
+    });
+%}
 
 ### List notes with pagination
 GET {{baseUrl}}/api/teams/{{teamId}}/notes?page=0&size=20
 Authorization: Basic alice demo-password
 
+> {%
+    const page = /** @type {{items: Array<{id: string}>}} */ (response.body);
+    client.test("The page includes the created note", function () {
+        client.assert(response.status === 200, "Expected 200");
+        client.assert(Array.isArray(page.items), "Expected a page of notes");
+        client.assert(page.items.some(note => note.id === client.global.get("noteId")),
+            "Expected the created note in the page");
+    });
+%}
+
 ### A teammate can delete the note (204)
 DELETE {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
 Authorization: Basic bob demo-password
 
+> {%
+    client.test("Bob can delete the note", function () {
+        client.assert(response.status === 204, "Expected 204");
+    });
+%}
+
 ### The deleted note now returns 404
 GET {{baseUrl}}/api/teams/{{teamId}}/notes/{{noteId}}
 Authorization: Basic alice demo-password
+
+> {%
+    client.test("The deleted note is no longer available", function () {
+        client.assert(response.status === 404, "Expected 404");
+    });
+%}
+
+### NUL validation — expect 400 with fieldErrors.content
+POST {{baseUrl}}/api/teams/{{teamId}}/notes
+Authorization: Basic alice demo-password
+Content-Type: application/json
+
+{
+  "title": "This title is valid",
+  "content": "before\u0000after"
+}
+
+> {%
+    const error = /** @type {{code: string, fieldErrors: {content?: string, title?: string}}} */ (response.body);
+    client.test("NUL content returns a field validation error", function () {
+        client.assert(response.status === 400, "Expected 400");
+        client.assert(error.code === "BAD_REQUEST", "Expected a validation error");
+        client.assert(error.fieldErrors
+            && error.fieldErrors.content === "must not contain NUL (U+0000) characters",
+            "Expected fieldErrors.content to identify the NUL character");
+        client.assert(error.fieldErrors && !error.fieldErrors.title, "The title should remain valid");
+    });
+%}

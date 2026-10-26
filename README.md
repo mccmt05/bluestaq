@@ -100,7 +100,14 @@ curl -u alice:demo-password http://localhost:8080/api/teams
 
 In Windows PowerShell, use `curl.exe` for these commands. For a complete
 create/read/update/conflict/delete walkthrough, open [requests.http](requests.http)
-in IntelliJ's HTTP client and run its requests in order.
+in IntelliJ's HTTP client and run each request individually in order. The create
+request saves `noteId` for the later requests. The final NUL validation request
+should return `400` with `fieldErrors.content`.
+
+For a browser check, open `http://localhost:8080/health` or
+`http://localhost:8080/api/teams`. When prompted for credentials, use `alice` and
+`demo-password` to see both teams. This is a REST API with JSON responses;
+there is no frontend page mapped to `/`.
 
 ### Build and test
 
@@ -356,8 +363,8 @@ See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for reproduced security gaps,
 dependency advisory assessment, and the scope of the checks performed.
 
 `verify` and executable JAR packaging were checked on Windows x64 with Temurin
-JDK 21. Docker execution has not been verified on
-this workstation because Docker is not installed.
+JDK 21. Docker execution has not been verified on this workstation because
+Docker is not installed.
 
 ## Deliberately outside this version
 
@@ -379,16 +386,19 @@ volume or page drift becomes a problem.
 ```text
 src/main/java/com/bluestaq/notes/
   api/       Shared errors and health endpoint
-  config/    Authentication and JSON configuration
+  config/    Authentication, JSON configuration, and request limits
   note/      Note requests, controller, service, and SQL repository
   team/      Team listing and membership checks
 src/main/resources/db/
   migration/ Schema migrations for every environment
   local/     Demo data, enabled only by the local profile
+  permissions/ Compose-specific grants for the restricted runtime role
 src/test/java/com/bluestaq/notes/
   NotesIntegrationTest.java   API, authorization, SQL, and concurrency tests
+  DatabasePrivilegesTest.java Runtime role permissions and separate migrations
   LocalDevelopment.java       Local launcher with persistent PostgreSQL
   LocalDevelopmentTest.java   Application/database restart test
+  config/RequestRateLimiterTest.java Throttling, expiry, storage, and concurrency checks
 ```
 
 Framework references: [Spring Boot system requirements](https://docs.spring.io/spring-boot/3.5/system-requirements.html),
