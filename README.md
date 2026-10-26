@@ -56,6 +56,23 @@ check and the application waits for it before starting. Data lives in the
 packages the application without running tests; run the test command below
 separately.
 
+The runtime connection uses `notes_app`, with read access to identities and
+memberships and CRUD access to notes. Flyway connects separately as the owner to
+apply migrations and grants. Set `DB_APP_PASSWORD` for the runtime role and
+`DB_PASSWORD` for the owner; the defaults are public local-demo values.
+
+For a Compose volume created before the runtime-role change, preserve the data
+and run the initialization script once before starting the updated app:
+
+```sh
+docker compose up -d db
+docker compose exec db psql -v ON_ERROR_STOP=1 -U team_notes -d team_notes -f /docker-entrypoint-initdb.d/01-runtime-role.sql
+docker compose up --build --wait
+```
+
+New volumes run that script automatically. Changing a password environment
+variable does not rotate a password already stored in an existing database.
+
 Both startup options are local demos with public credentials. Do not expose
 them as a production deployment. Use only one option at a time on port 8080.
 
@@ -118,7 +135,33 @@ outside the exercise scope. Use a separate database from the local demo.
 | `SPRING_PROFILES_ACTIVE` | none                                          | `local` enables demo data migrations               |
 
 The embedded local launcher supplies its own DataSource and does not use the
-`DB_*` settings. Compose uses the environment's `DB_PASSWORD` for both services.
+`DB_*` settings. Compose uses `DB_PASSWORD` for the database owner/Flyway and
+`DB_APP_PASSWORD` for the restricted runtime role. For a separately managed
+database, provision a restricted runtime role and configure `SPRING_FLYWAY_URL`,
+`SPRING_FLYWAY_USER`, and `SPRING_FLYWAY_PASSWORD` for migration credentials.
+The Compose-specific grant callback expects a role named `notes_app`.
+
+### Request security limits
+
+Request bodies are capped at **256 KiB before JSON parsing**, including chunked
+transfers. Larger bodies return JSON with HTTP **413**. The existing title and
+content character limits still apply after parsing.
+
+Before password verification, each 60-second window permits **120 requests per
+socket IP**, **60 Basic attempts per username**, and **600 requests across the
+application instance**. Both successful and unsuccessful requests consume the
+budget; changing a password or forwarding header cannot reset it. Exceeding a
+budget returns JSON with HTTP **429** and a `Retry-After` header. Access recovers
+when the window expires. Anonymous GET `/health` probes remain available.
+
+Configure these budgets under `notes.security` in `application.yml` (or Spring
+environment overrides, such as `NOTES_SECURITY_MAXREQUESTBYTES`). Counters
+retain at most 10,000 combined source/account identities and reject new identities
+if full. They are in memory per process and reset on restart. Multiple replicas
+need coordinated limits at a trusted proxy or shared store. Fixed windows can
+allow bursts near a boundary. Forwarding headers are disabled; behind a proxy,
+the socket IP budget is shared by clients using that proxy until a trusted edge
+limiter is configured. Tune the budgets for the actual deployment.
 
 If Maven reports a `PKIX path building failed` error on a Windows network whose
 certificates are trusted by Windows, use the Windows trust store for that shell:
@@ -238,6 +281,8 @@ as well to keep the first API simple.
 
 - Trim titles; require 1-200 characters after trimming.
 - Require a string content field, allowing empty content up to 20,000 characters.
+- Reject NUL (U+0000) characters in titles and content on both create and update,
+  returning a field-specific `400` error before the database write.
 - Require title, content, and a positive integer version for updates; there is
   no partial update. New notes start at version 1.
 - Reject unknown JSON properties and values of the wrong JSON type. Length
@@ -283,7 +328,7 @@ The test-scoped local launcher provides a second option when Docker is unavailab
 
 ## Verification
 
-The automated suite has 50 passing tests/cases against PostgreSQL, covering:
+The automated suite has 122 passing tests/cases, including PostgreSQL integration checks, covering:
 
 - A member can create, list, read, update, and delete a team note.
 - Teammates can collaborate on the same note.
@@ -291,15 +336,27 @@ The automated suite has 50 passing tests/cases against PostgreSQL, covering:
   that team, including attempts that substitute a known note ID.
 - Requests without valid authentication are rejected.
 - Invalid titles, content, IDs, and pagination produce the documented errors.
+- NUL characters in either text field return validation errors on create/update;
+  rejected updates preserve the entire note, while legal whitespace and Unicode remain intact.
 - Competing updates using the same version allow one write and reject the other.
 - Pagination has deterministic ordering, including equal updated timestamps.
 - Migrations work on an empty database, do not seed production accounts, and
   can run again without reapplying changes.
 - Notes survive actual application and PostgreSQL shutdown/restart cycles.
 - A running HTTP server authenticates requests without creating a session.
+- SQL injection payloads, markup returned as JSON, server-owned metadata rejection,
+  cross-origin request examples, XML rejection, and response-header injection.
+- Fixed-length and chunked HTTP body limits at the byte boundary for creates and updates.
+- Source/account/global request budgets, automatic recovery, concurrent reservations,
+  bounded counter storage, and forwarding-header spoofing attempts.
+- Separate migration and runtime roles, successful API persistence with restricted
+  permissions, and rejected runtime schema/account changes.
 
-`verify` and executable JAR packaging were checked on Windows x64 with IntelliJ's
-bundled JDK 25 (compiling for Java 21). Docker execution has not been verified on
+See [SECURITY_REVIEW.md](SECURITY_REVIEW.md) for reproduced security gaps,
+dependency advisory assessment, and the scope of the checks performed.
+
+`verify` and executable JAR packaging were checked on Windows x64 with Temurin
+JDK 21. Docker execution has not been verified on
 this workstation because Docker is not installed.
 
 ## Deliberately outside this version
@@ -313,7 +370,7 @@ background jobs, or separate microservices.
 Reassess priorities based on actual usage. Likely next steps are production
 identity integration and membership administration, revision history to recover
 edits or deletions, and title/content search. Before exposing the service
-publicly, add operational configuration for backups, request limits, and
+publicly, add operational configuration for backups, coordinated proxy limits, and
 structured monitoring. Cursor pagination can replace offset pagination if note
 volume or page drift becomes a problem.
 

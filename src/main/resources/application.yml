@@ -12,6 +12,16 @@ spring:
     mapper:
       allow-coercion-of-scalars: false
 server:
+  # Socket peers, not caller-supplied forwarding headers, identify rate-limit sources.
+  forward-headers-strategy: none
   error:
     include-message: never
     include-stacktrace: never
+notes:
+  security:
+    max-request-bytes: 262144
+    requests-per-ip: 120
+    requests-per-account: 60
+    requests-per-window: 600
+    window-seconds: 60
+    max-tracked-identities: 10000

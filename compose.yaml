@@ -5,10 +5,12 @@ services:
       POSTGRES_DB: team_notes
       POSTGRES_USER: team_notes
       POSTGRES_PASSWORD: ${DB_PASSWORD:-team_notes}
+      DB_APP_PASSWORD: ${DB_APP_PASSWORD:-team_notes_app}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - notes-data:/var/lib/postgresql/data
+      - ./docker/postgres:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U team_notes -d team_notes"]
       interval: 3s
@@ -21,8 +23,12 @@ services:
     environment:
       SPRING_PROFILES_ACTIVE: local
       DB_URL: jdbc:postgresql://db:5432/team_notes
-      DB_USERNAME: team_notes
-      DB_PASSWORD: ${DB_PASSWORD:-team_notes}
+      DB_USERNAME: notes_app
+      DB_PASSWORD: ${DB_APP_PASSWORD:-team_notes_app}
+      SPRING_FLYWAY_URL: jdbc:postgresql://db:5432/team_notes
+      SPRING_FLYWAY_USER: team_notes
+      SPRING_FLYWAY_PASSWORD: ${DB_PASSWORD:-team_notes}
+      SPRING_FLYWAY_LOCATIONS: classpath:db/migration,classpath:db/local,classpath:db/permissions
     depends_on:
       db:
         condition: service_healthy

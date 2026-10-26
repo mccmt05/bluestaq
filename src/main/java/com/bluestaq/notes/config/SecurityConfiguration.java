@@ -2,6 +2,7 @@ package com.bluestaq.notes.config;
 
 import com.bluestaq.notes.api.ApiError;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.http.HttpMethod;
@@ -17,6 +18,9 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.AuthenticationEntryPoint;
 import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.web.authentication.www.BasicAuthenticationFilter;
+
+import java.time.Clock;
 
 /**
  * Configures database-backed HTTP Basic authentication for the stateless JSON API.
@@ -24,7 +28,30 @@ import org.springframework.security.web.SecurityFilterChain;
  * This setup targets explicit Authorization-header clients and requires HTTPS outside the local demo.
  */
 @Configuration
+@EnableConfigurationProperties(SecurityLimits.class)
 public class SecurityConfiguration {
+    /**
+     * Supplies a testable time source for short-lived authentication budgets.
+     *
+     * @return the UTC clock used by the request limiter
+     */
+    @Bean
+    Clock rateLimitClock() {
+        return Clock.systemUTC();
+    }
+
+    /**
+     * Shares bounded counters between requests without registering a second servlet filter.
+     *
+     * @param limits validated request budgets
+     * @param rateLimitClock time source for counter expiration
+     * @return the limiter for this application instance
+     */
+    @Bean
+    RequestRateLimiter requestRateLimiter(SecurityLimits limits, Clock rateLimitClock) {
+        return new RequestRateLimiter(limits, rateLimitClock);
+    }
+
     /**
      * Supplies BCrypt verification for the password hashes stored in {@code app_user}.
      *
@@ -60,11 +87,14 @@ public class SecurityConfiguration {
      *
      * @param http Spring Security's filter-chain builder
      * @param mapper shared JSON mapper for security error responses
+     * @param limits validated request-body and throttling budgets
+     * @param limiter shared pre-authentication request counters
      * @return the filter chain guarding application requests
      * @throws Exception if Spring Security cannot construct the filter chain
      */
     @Bean
-    SecurityFilterChain securityFilterChain(HttpSecurity http, ObjectMapper mapper) throws Exception {
+    SecurityFilterChain securityFilterChain(HttpSecurity http, ObjectMapper mapper,
+                                           SecurityLimits limits, RequestRateLimiter limiter) throws Exception {
         AuthenticationEntryPoint unauthorized = (request, response, exception) -> {
             response.setStatus(401);
             response.setHeader("WWW-Authenticate", "Basic realm=\"team-notes\"");
@@ -80,6 +110,8 @@ public class SecurityConfiguration {
                 .requestCache(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .logout(AbstractHttpConfigurer::disable)
+                .addFilterBefore(new RequestThrottlingFilter(limiter, mapper), BasicAuthenticationFilter.class)
+                .addFilterAfter(new RequestBodyLimitFilter(limits.maxRequestBytes(), mapper), BasicAuthenticationFilter.class)
                 .authorizeHttpRequests(auth -> auth
                         .requestMatchers(HttpMethod.GET, "/health").permitAll()
                         .anyRequest().authenticated())

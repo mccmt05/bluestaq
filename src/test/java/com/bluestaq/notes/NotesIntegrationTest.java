@@ -25,6 +25,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -36,6 +37,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.time.Clock;
+import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
 import java.util.UUID;
@@ -43,9 +46,11 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.when;
 import static org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.httpBasic;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -60,9 +65,13 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 /**
  * Exercises authentication, authorization, validation, and persistence against a real PostgreSQL process.
  * Local migrations supply fixed team memberships, and the note table is cleared before each test.
- * Most requests use MockMvc with the real security filters and services; one test also uses the live HTTP listener.
+ * Requests use the real security filters and services, with live HTTP tests for body transfer framing.
+ * Only the limiter's clock is controlled so each test has an independent window without sleeping.
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
+        "notes.security.requests-per-ip=12", "notes.security.requests-per-account=8",
+        "notes.security.requests-per-window=24"
+})
 @AutoConfigureMockMvc
 @ActiveProfiles("local")
 class NotesIntegrationTest {
@@ -72,12 +81,14 @@ class NotesIntegrationTest {
     private static final String BOB = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2";
     private static final String NOTES = "/api/teams/" + TEAM_A + "/notes";
     private static final EmbeddedPostgres DATABASE = startDatabase();
+    private static final AtomicLong LIMIT_TIME = new AtomicLong();
 
     @Autowired MockMvc mvc;
     @Autowired ObjectMapper json;
     @Autowired JdbcTemplate jdbc;
     @Autowired NoteService service;
     @Autowired PlatformTransactionManager transactionManager;
+    @MockitoBean(name = "rateLimitClock") Clock rateLimitClock;
     @LocalServerPort int port;
 
     /**
@@ -121,6 +132,8 @@ class NotesIntegrationTest {
      */
     @BeforeEach
     void clearNotes() {
+        LIMIT_TIME.addAndGet(60000);
+        when(rateLimitClock.millis()).thenAnswer(ignored -> LIMIT_TIME.get());
         // This temporary test database must start with no notes for each test.
         //noinspection SqlWithoutWhere
         jdbc.update("DELETE FROM note");
@@ -483,6 +496,375 @@ class NotesIntegrationTest {
             assertThat(response.headers().firstValue("Set-Cookie")).isEmpty();
         }
         mvc.perform(get("/health")).andExpect(status().isOk()).andExpect(jsonPath("$.status").value("UP"));
+    }
+
+    /**
+     * Confirms that SQL metacharacters remain note data during creation, reading, and updates.
+     *
+     * @param payload SQL-shaped text that must never change the query structure
+     * @throws Exception if fixture creation or request execution fails
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"' OR '1'='1' --", "'); SELECT 1; --", "test' UNION SELECT NULL --"})
+    void sqlPayloadsAreStoredAsLiteralNoteText(String payload) throws Exception {
+        JsonNode created = create(TEAM_A, "alice", payload, payload);
+        String path = NOTES + "/" + created.get("id").asText();
+        mvc.perform(get(path).with(httpBasic("bob", "demo-password")))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.title").value(payload))
+                .andExpect(jsonPath("$.content").value(payload));
+        mvc.perform(put(path).with(httpBasic("bob", "demo-password"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(new UpdateNoteRequest(payload, payload, 1L))))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.version").value(2))
+                .andExpect(jsonPath("$.content").value(payload));
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM note", Long.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM app_user", Long.class)).isEqualTo(3);
+    }
+
+    /**
+     * Rejects SQL-shaped usernames rather than allowing them to change the authentication query.
+     *
+     * @param username attempted SQL injection in the username field
+     * @throws Exception if request execution fails
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"alice' --", "' OR '1'='1' --", "alice' OR 1=1 --"})
+    void sqlPayloadsCannotBypassAuthentication(String username) throws Exception {
+        mvc.perform(get("/api/teams").with(httpBasic(username, "demo-password")))
+                .andExpect(status().isUnauthorized());
+    }
+
+    /**
+     * Preserves markup as plain note data while requiring JSON responses and anti-sniffing headers.
+     * This checks the API boundary; a future HTML client must still render note text safely.
+     *
+     * @param markup candidate stored-XSS payload that must remain JSON string data
+     * @throws Exception if fixture creation or request execution fails
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "<script>alert('xss')</script>",
+            "<img src=x onerror=alert(1)>",
+            "</script><script>alert(1)</script>",
+            "<svg/onload=alert(1)>"
+    })
+    void markupIsReturnedAsJsonInsteadOfRenderedHtml(String markup) throws Exception {
+        JsonNode created = create(TEAM_A, "alice", markup, markup);
+        mvc.perform(get(NOTES + "/" + created.get("id").asText()).with(httpBasic("bob", "demo-password")))
+                .andExpect(status().isOk()).andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(header().string("X-Content-Type-Options", "nosniff"))
+                .andExpect(header().string("X-Frame-Options", "DENY"))
+                .andExpect(jsonPath("$.title").value(markup)).andExpect(jsonPath("$.content").value(markup));
+    }
+
+    /**
+     * Refuses HTML content negotiation so a note containing markup cannot become an HTML document.
+     *
+     * @throws Exception if fixture creation or request execution fails
+     */
+    @Test
+    void noteResponsesCannotBeNegotiatedAsHtml() throws Exception {
+        JsonNode created = create(TEAM_A, "alice", "Markup", "<script>alert(1)</script>");
+        String response = mvc.perform(get(NOTES + "/" + created.get("id").asText())
+                        .with(httpBasic("alice", "demo-password")).accept(MediaType.TEXT_HTML))
+                .andExpect(status().isNotAcceptable()).andReturn().getResponse().getContentAsString();
+        assertThat(response).doesNotContain("<script>");
+    }
+
+    /**
+     * Prevents creation requests from assigning server-owned metadata or polymorphic type hints.
+     *
+     * @param field protected or unrecognized property to inject into a valid creation request
+     * @throws Exception if serialization or request execution fails
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"id", "teamId", "createdBy", "updatedBy", "createdAt", "updatedAt", "version", "@class"})
+    void creationRejectsMassAssignmentOfServerOwnedFields(String field) throws Exception {
+        var body = json.createObjectNode().put("title", "Attempt").put("content", "Data");
+        body.put(field, TEAM_B);
+        mvc.perform(post(NOTES).with(httpBasic("alice", "demo-password"))
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(body)))
+                .andExpect(status().isBadRequest());
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM note", Long.class)).isZero();
+    }
+
+    /**
+     * Prevents an otherwise valid update from changing identity, ownership, or authorship metadata.
+     *
+     * @param field server-controlled property to append to the replacement request
+     * @throws Exception if fixture creation, serialization, or request execution fails
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"id", "teamId", "createdBy", "updatedBy", "createdAt", "updatedAt"})
+    void updatesRejectMassAssignmentOfServerOwnedFields(String field) throws Exception {
+        JsonNode created = create(TEAM_A, "alice", "Original", "Unchanged");
+        var body = json.createObjectNode().put("title", "Attempt").put("content", "Changed").put("version", 1);
+        body.put(field, TEAM_B);
+        mvc.perform(put(NOTES + "/" + created.get("id").asText()).with(httpBasic("bob", "demo-password"))
+                        .contentType(MediaType.APPLICATION_JSON).content(json.writeValueAsString(body)))
+                .andExpect(status().isBadRequest());
+        assertThat(jdbc.queryForObject("SELECT version FROM note", Long.class)).isEqualTo(1);
+        assertThat(jdbc.queryForObject("SELECT content FROM note", String.class)).isEqualTo("Unchanged");
+    }
+
+    /**
+     * Verifies that browser-simple content types cannot create notes through cross-origin form requests.
+     *
+     * @param mediaType content type available to browser form or simple cross-origin requests
+     * @throws Exception if request execution fails
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"text/plain", "application/x-www-form-urlencoded"})
+    void crossOriginSimpleRequestsCannotCreateNotes(String mediaType) throws Exception {
+        mvc.perform(post(NOTES).with(httpBasic("alice", "demo-password"))
+                        .header("Origin", "https://attacker.example").contentType(mediaType)
+                        .content("{\"title\":\"Attempt\",\"content\":\"Changed\"}"))
+                .andExpect(status().is4xxClientError())
+                .andExpect(header().doesNotExist("Access-Control-Allow-Origin"));
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM note", Long.class)).isZero();
+    }
+
+    /**
+     * Verifies that the API does not grant a foreign origin permission to send authenticated JSON requests.
+     *
+     * @throws Exception if request execution fails
+     */
+    @Test
+    void crossOriginPreflightDoesNotGrantAccess() throws Exception {
+        mvc.perform(request(HttpMethod.OPTIONS, NOTES).header("Origin", "https://attacker.example")
+                        .header("Access-Control-Request-Method", "POST")
+                        .header("Access-Control-Request-Headers", "authorization,content-type"))
+                .andExpect(status().is4xxClientError())
+                .andExpect(header().doesNotExist("Access-Control-Allow-Origin"));
+    }
+
+    /**
+     * Rejects XML without parsing an external entity, since this service accepts JSON request records only.
+     *
+     * @throws Exception if request execution fails
+     */
+    @Test
+    void xmlAndExternalEntityPayloadsAreRejected() throws Exception {
+        String externalEntityLocation = "file:///nonexistent-security-audit";
+        mvc.perform(post(NOTES).with(httpBasic("alice", "demo-password"))
+                        .contentType(MediaType.APPLICATION_XML)
+                        .content("<!DOCTYPE note [<!ENTITY xxe SYSTEM '" + externalEntityLocation + "'>]>"
+                                + "<note><title>&xxe;</title><content>Attempt</content></note>"))
+                .andExpect(status().isUnsupportedMediaType());
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM note", Long.class)).isZero();
+    }
+
+    /**
+     * Keeps CR/LF input inside the JSON body and uses only server-generated values in response headers.
+     *
+     * @throws Exception if serialization or request execution fails
+     */
+    @Test
+    void noteTextCannotInjectResponseHeaders() throws Exception {
+        var response = mvc.perform(post(NOTES).with(httpBasic("alice", "demo-password"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(new CreateNoteRequest("Title\r\nX-Injected: yes", "Text"))))
+                .andExpect(status().isCreated()).andExpect(header().doesNotExist("X-Injected"))
+                .andReturn().getResponse();
+        assertThat(response.getHeader("Location")).doesNotContain("\r", "\n", "X-Injected");
+    }
+
+    /**
+     * Ensures client-visible validation errors do not echo supplied content or reveal implementation details.
+     *
+     * @throws Exception if request execution fails
+     */
+    @Test
+    void errorResponsesDoNotExposeInputOrInternalDetails() throws Exception {
+        String response = mvc.perform(post(NOTES).with(httpBasic("alice", "demo-password"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"title\":\"\",\"content\":\"private-security-marker\"}"))
+                .andExpect(status().isBadRequest()).andReturn().getResponse().getContentAsString();
+        assertThat(response).doesNotContain("private-security-marker", "org.springframework", "java.lang", "SELECT ", "password_hash");
+    }
+
+    /**
+     * Rejects decoded NUL characters as field validation errors on both writing endpoints.
+     * Rejected creates leave no notes; rejected updates preserve all existing text, version, and audit metadata.
+     *
+     * @param method POST for creation or PUT for replacement
+     * @param field editable text field containing the NUL character
+     * @param invalidText text with a NUL at a boundary, in the middle, or as the entire value
+     * @throws Exception if fixture creation, JSON processing, or request execution fails
+     */
+    @ParameterizedTest
+    @MethodSource("nulCharacterRequests")
+    void nulCharactersReturnFieldErrorsWithoutChangingData(String method, String field, String invalidText)
+            throws Exception {
+        JsonNode original = null;
+        String path = NOTES;
+        if ("PUT".equals(method)) {
+            original = create(TEAM_A, "alice", "Original", "Unchanged");
+            path += "/" + original.get("id").asText();
+        }
+        var body = json.createObjectNode().put("title", "Valid").put("content", "Replacement");
+        body.put(field, invalidText);
+        if (original != null) {
+            body.put("version", original.get("version").asLong());
+        }
+        String response = mvc.perform(request(HttpMethod.valueOf(method), path)
+                        .with(httpBasic("alice", "demo-password")).contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(body)))
+                .andExpect(status().isBadRequest()).andExpect(jsonPath("$.code").value("BAD_REQUEST"))
+                .andExpect(jsonPath("$.fieldErrors." + field).value("must not contain NUL (U+0000) characters"))
+                .andReturn().getResponse().getContentAsString();
+        assertThat(response).doesNotContain("\\u0000", "org.postgresql", "SQLException", "stackTrace");
+        if (original == null) {
+            assertThat(jdbc.queryForObject("SELECT count(*) FROM note", Long.class)).isZero();
+        } else {
+            String current = mvc.perform(get(path).with(httpBasic("alice", "demo-password")))
+                    .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+            assertThat(json.readTree(current)).isEqualTo(original);
+        }
+    }
+
+    /**
+     * Covers every editable field on both endpoints with leading, embedded, trailing, and standalone NUL values.
+     *
+     * @return method, field, and invalid decoded text combinations serialized as escaped JSON by each test
+     */
+    static Stream<Arguments> nulCharacterRequests() {
+        String nul = Character.toString(0);
+        return Stream.of("POST", "PUT").flatMap(method -> Stream.of("title", "content")
+                .flatMap(field -> Stream.of(nul + "Start", "Mid" + nul + "dle", "End" + nul, nul)
+                        .map(text -> Arguments.of(method, field, text))));
+    }
+
+    /**
+     * Preserves allowed empty, multiline, tabbed, and Unicode content while applying NUL validation on both records.
+     *
+     * @param text legal plain text that must be stored and returned exactly
+     * @throws Exception if fixture creation, serialization, or request execution fails
+     */
+    @ParameterizedTest
+    @ValueSource(strings = {"", "First line\n\tSecond line\r\nUnicode: café ☕"})
+    void nulValidationPreservesOtherPlainText(String text) throws Exception {
+        JsonNode created = create(TEAM_A, "alice", "  Release\nchecklist  ", text);
+        assertThat(created.get("title").asText()).isEqualTo("Release\nchecklist");
+        assertThat(created.get("content").asText()).isEqualTo(text);
+        mvc.perform(put(NOTES + "/" + created.get("id").asText()).with(httpBasic("alice", "demo-password"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(new UpdateNoteRequest("  Updated\nchecklist  ", text, 1L))))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.title").value("Updated\nchecklist"))
+                .andExpect(jsonPath("$.content").value(text));
+    }
+
+    /**
+     * Verifies the byte boundary over a real socket for fixed-length and chunked create/update requests.
+     * Multibyte content checks UTF-8 byte counting; title whitespace checks size before normalization.
+     *
+     * @param chunked whether to omit Content-Length and use chunked transfer
+     * @param delta bytes below, at, or above the configured limit
+     * @param method POST for creation or PUT for replacement
+     * @throws Exception if request construction, transport, or response parsing fails
+     */
+    @ParameterizedTest
+    @MethodSource("bodyLimitRequests")
+    void bodyByteLimitCoversKnownAndUnknownLengths(boolean chunked, int delta, String method) throws Exception {
+        String path = NOTES;
+        if ("PUT".equals(method)) {
+            path += "/" + create(TEAM_A, "alice", "Original", "Original").get("id").asText();
+        }
+        String prefix = "{\"title\":\"";
+        String suffix = "Valid\",\"content\":\"é\"" + ("PUT".equals(method) ? ",\"version\":1}" : "}");
+        int targetBytes = 262144 + delta;
+        String body = prefix + " ".repeat(targetBytes - (prefix + suffix).getBytes(StandardCharsets.UTF_8).length) + suffix;
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        assertThat(bytes).hasSize(targetBytes);
+        HttpRequest.BodyPublisher publisher = chunked
+                ? HttpRequest.BodyPublishers.ofInputStream(() -> new java.io.ByteArrayInputStream(bytes))
+                : HttpRequest.BodyPublishers.ofByteArray(bytes);
+        try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()) {
+            var response = client.send(HttpRequest.newBuilder(URI.create("http://localhost:" + port + path))
+                            .header("Authorization", "Basic " + Base64.getEncoder().encodeToString(
+                                    "alice:demo-password".getBytes(StandardCharsets.UTF_8)))
+                            .header("Content-Type", "application/json").timeout(Duration.ofSeconds(10))
+                            .method(method, publisher).build(), HttpResponse.BodyHandlers.ofString());
+            if (delta > 0) {
+                assertThat(response.statusCode()).isEqualTo(413);
+                assertThat(json.readTree(response.body()).get("code").asText()).isEqualTo("PAYLOAD_TOO_LARGE");
+                assertThat(jdbc.queryForObject("SELECT count(*) FROM note", Long.class))
+                        .isEqualTo("PUT".equals(method) ? 1 : 0);
+                if ("PUT".equals(method)) {
+                    assertThat(jdbc.queryForObject("SELECT title FROM note", String.class)).isEqualTo("Original");
+                }
+            } else {
+                assertThat(response.statusCode()).isEqualTo("POST".equals(method) ? 201 : 200);
+                assertThat(json.readTree(response.body()).get("title").asText()).isEqualTo("Valid");
+                assertThat(json.readTree(response.body()).get("content").asText()).isEqualTo("é");
+            }
+        }
+    }
+
+    /**
+     * Covers both HTTP body framings at the exact byte boundary for each writing operation.
+     *
+     * @return create/update cases one byte below, exactly at, and one byte above the size limit
+     */
+    static Stream<Arguments> bodyLimitRequests() {
+        return Stream.of(false, true).flatMap(chunked -> Stream.of(-1, 0, 1)
+                .flatMap(delta -> Stream.of("POST", "PUT").map(method -> Arguments.of(chunked, delta, method))));
+    }
+
+    /**
+     * Blocks failed Basic attempts across changing sources and expires the block without a permanent lockout.
+     * A valid password cannot bypass an active budget; another account remains usable.
+     *
+     * @throws Exception if request execution fails
+     */
+    @Test
+    void authenticationAttemptsAreThrottledAndRecoverAfterTheWindow() throws Exception {
+        for (int attempt = 0; attempt < 8; attempt++) {
+            mvc.perform(get("/api/teams").with(httpBasic("alice", "wrong-password")))
+                    .andExpect(status().isUnauthorized());
+        }
+        mvc.perform(get("/api/teams").with(httpBasic("alice", "demo-password"))
+                        .with(request -> { request.setRemoteAddr("192.0.2.10"); return request; }))
+                .andExpect(status().isTooManyRequests()).andExpect(header().string("Retry-After", "60"))
+                .andExpect(jsonPath("$.code").value("TOO_MANY_REQUESTS"));
+        mvc.perform(get("/api/teams").with(httpBasic("bob", "demo-password"))).andExpect(status().isOk());
+        LIMIT_TIME.addAndGet(60000);
+        mvc.perform(get("/api/teams").with(httpBasic("alice", "demo-password"))).andExpect(status().isOk());
+    }
+
+    /**
+     * Uses socket peers for source budgets and rejects resets attempted with forwarding headers.
+     *
+     * @throws Exception if request execution fails
+     */
+    @Test
+    void sourceThrottlingCannotBeBypassedWithForwardingHeaders() throws Exception {
+        for (int attempt = 0; attempt < 12; attempt++) {
+            mvc.perform(get("/api/teams")).andExpect(status().isUnauthorized());
+        }
+        mvc.perform(get("/api/teams").with(httpBasic("bob", "demo-password"))
+                        .header("X-Forwarded-For", "192.0.2.100").header("Forwarded", "for=192.0.2.101"))
+                .andExpect(status().isTooManyRequests()).andExpect(header().string("Retry-After", "60"));
+        mvc.perform(get("/api/teams").with(httpBasic("bob", "demo-password"))
+                        .with(request -> { request.setRemoteAddr("192.0.2.20"); return request; }))
+                .andExpect(status().isOk());
+    }
+
+    /**
+     * Caps aggregate traffic across changing sources while retaining anonymous health checks.
+     *
+     * @throws Exception if request execution fails
+     */
+    @Test
+    void instanceBudgetLimitsRotatingSourcesButKeepsHealthAvailable() throws Exception {
+        for (int attempt = 0; attempt < 24; attempt++) {
+            String source = "192.0.2." + attempt;
+            mvc.perform(get("/api/teams").with(request -> { request.setRemoteAddr(source); return request; }))
+                    .andExpect(status().isUnauthorized());
+        }
+        mvc.perform(get("/api/teams").with(request -> { request.setRemoteAddr("192.0.2.200"); return request; }))
+                .andExpect(status().isTooManyRequests());
+        mvc.perform(get("/health")).andExpect(status().isOk());
     }
 
     /**
